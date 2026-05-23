@@ -8,12 +8,85 @@
 import SwiftUI
 import WebKit
 
+struct WebTextSelection: Equatable {
+    let plainText: String
+    let html: String
+    let fragments: [FormattedTextFragment]
+
+    init?(messageBody: Any) {
+        guard let dict = messageBody as? [String: Any],
+              let plainText = dict["text"] as? String,
+              let html = dict["html"] as? String
+        else { return nil }
+
+        self.plainText = plainText
+        self.html = html
+
+        let rawFragments = dict["fragments"] as? [[String: Any]] ?? []
+        self.fragments = rawFragments.compactMap { FormattedTextFragment(dictionary: $0) }
+    }
+
+    var attributedString: NSAttributedString? {
+        let document = "<!DOCTYPE html><html><body>\(html)</body></html>"
+        guard let data = document.data(using: .utf8) else { return nil }
+        return try? NSAttributedString(
+            data: data,
+            options: [
+                .documentType: NSAttributedString.DocumentType.html,
+                .characterEncoding: String.Encoding.utf8.rawValue,
+            ],
+            documentAttributes: nil
+        )
+    }
+}
+
+struct FormattedTextFragment: Equatable {
+    let text: String
+    let tags: [String]
+    let styles: TextRunStyles
+
+    init?(dictionary: [String: Any]) {
+        guard let text = dictionary["text"] as? String else { return nil }
+        self.text = text
+        self.tags = dictionary["tags"] as? [String] ?? []
+        self.styles = TextRunStyles(dictionary: dictionary["styles"] as? [String: String] ?? [:])
+    }
+}
+
+struct TextRunStyles: Equatable, CustomStringConvertible {
+    let fontWeight: String?
+    let fontStyle: String?
+    let textDecoration: String?
+    let color: String?
+    let backgroundColor: String?
+
+    init(dictionary: [String: String]) {
+        fontWeight = dictionary["fontWeight"]
+        fontStyle = dictionary["fontStyle"]
+        textDecoration = dictionary["textDecoration"]
+        color = dictionary["color"]
+        backgroundColor = dictionary["backgroundColor"]
+    }
+
+    var description: String {
+        [
+            fontWeight.map { "weight=\($0)" },
+            fontStyle.map { "style=\($0)" },
+            textDecoration.map { "decoration=\($0)" },
+            color.map { "color=\($0)" },
+            backgroundColor.map { "background=\($0)" },
+        ]
+        .compactMap(\.self)
+        .joined(separator: ", ")
+    }
+}
+
 struct FormattedTextWebView: UIViewRepresentable {
     let html: String
-    var onTextSelected: (String) -> Void
+    var onSelection: (WebTextSelection) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onTextSelected: onTextSelected)
+        Coordinator(onSelection: onSelection)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -42,25 +115,99 @@ struct FormattedTextWebView: UIViewRepresentable {
 
     static let selectionListenerScript = """
     (function() {
+        function ancestorTags(element) {
+            var tags = [];
+            var node = element;
+            while (node && node.nodeType === Node.ELEMENT_NODE && node.tagName !== 'BODY') {
+                tags.push(node.tagName.toLowerCase());
+                node = node.parentElement;
+            }
+            return tags;
+        }
+
+        function relevantStyles(element) {
+            if (!element || !window.getComputedStyle) return {};
+            var style = window.getComputedStyle(element);
+            return {
+                fontWeight: style.fontWeight,
+                fontStyle: style.fontStyle,
+                textDecoration: style.textDecorationLine,
+                color: style.color,
+                backgroundColor: style.backgroundColor
+            };
+        }
+
+        function fragmentsForRange(range) {
+            var fragments = [];
+            var walker = document.createTreeWalker(
+                range.commonAncestorContainer,
+                NodeFilter.SHOW_TEXT,
+                {
+                    acceptNode: function(node) {
+                        if (!range.intersectsNode(node)) {
+                            return NodeFilter.FILTER_REJECT;
+                        }
+                        if (!node.textContent.trim()) {
+                            return NodeFilter.FILTER_REJECT;
+                        }
+                        return NodeFilter.FILTER_ACCEPT;
+                    }
+                }
+            );
+
+            var textNode = walker.nextNode();
+            while (textNode) {
+                var parent = textNode.parentElement;
+                if (parent) {
+                    fragments.push({
+                        text: textNode.textContent,
+                        tags: ancestorTags(parent),
+                        styles: relevantStyles(parent)
+                    });
+                }
+                textNode = walker.nextNode();
+            }
+            return fragments;
+        }
+
+        function selectionPayload() {
+            var selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return null;
+
+            var plainText = selection.toString().trim();
+            if (!plainText) return null;
+
+            var range = selection.getRangeAt(0);
+            var container = document.createElement('div');
+            container.appendChild(range.cloneContents());
+
+            return {
+                text: plainText,
+                html: container.innerHTML,
+                fragments: fragmentsForRange(range)
+            };
+        }
+
         function reportSelection() {
             setTimeout(function() {
-                var text = window.getSelection().toString().trim();
-                if (text.length > 0) {
-                    window.webkit.messageHandlers.\(messageHandlerName).postMessage(text);
+                var payload = selectionPayload();
+                if (payload) {
+                    window.webkit.messageHandlers.\(messageHandlerName).postMessage(payload);
                 }
             }, 0);
         }
+
         document.addEventListener('mouseup', reportSelection);
         document.addEventListener('touchend', reportSelection);
     })();
     """
 
     final class Coordinator: NSObject, WKScriptMessageHandler {
-        private let onTextSelected: (String) -> Void
-        private var lastReportedSelection = ""
+        private let onSelection: (WebTextSelection) -> Void
+        private var lastReportedSelection: WebTextSelection?
 
-        init(onTextSelected: @escaping (String) -> Void) {
-            self.onTextSelected = onTextSelected
+        init(onSelection: @escaping (WebTextSelection) -> Void) {
+            self.onSelection = onSelection
         }
 
         func userContentController(
@@ -68,12 +215,12 @@ struct FormattedTextWebView: UIViewRepresentable {
             didReceive message: WKScriptMessage
         ) {
             guard message.name == FormattedTextWebView.messageHandlerName,
-                  let text = message.body as? String
+                  let selection = WebTextSelection(messageBody: message.body)
             else { return }
 
-            guard text != lastReportedSelection else { return }
-            lastReportedSelection = text
-            onTextSelected(text)
+            guard selection != lastReportedSelection else { return }
+            lastReportedSelection = selection
+            onSelection(selection)
         }
     }
 }
